@@ -246,9 +246,17 @@ export async function getTestRunResults(runId: string) {
           : 0,
       };
 
+  // Ensure every result has a testCase attached
+  const safeResults = run.results
+    .filter(Boolean)
+    .map((r) => ({
+      ...r,
+      testCase: r.testCase || { id: r.testCaseId || '', title: 'Unknown Test', code: '', type: 'unknown' },
+    }));
+
   return {
     run,
-    results: run.results,
+    results: safeResults,
     summary,
   };
 }

@@ -23,7 +23,7 @@ interface LiveTestRunnerProps {
 }
 
 export function LiveTestRunner({ tests, onComplete, isRunning }: LiveTestRunnerProps) {
-  const [liveTests, setLiveTests] = useState<LiveTest[]>(tests);
+  const [liveTests, setLiveTests] = useState<LiveTest[]>(Array.isArray(tests) ? tests.filter(Boolean) : []);
   const [consoleLines, setConsoleLines] = useState<string[]>([]);
   const [overallProgress, setOverallProgress] = useState(0);
   const [executionState, setExecutionState] = useState<'idle' | 'running' | 'complete'>('idle');

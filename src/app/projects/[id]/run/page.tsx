@@ -53,15 +53,17 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
       const res = await fetch(`/api/projects/${id}`);
       if (!res.ok) throw new Error('Failed to fetch project');
       const data = await res.json();
-      setProject(data.project);
+      setProject(data?.project || null);
 
       setLiveTests(
-        data.project.testCases.map((tc: TestCase) => ({
-          id: tc.id,
-          title: tc.title,
-          type: tc.type,
-          status: 'pending' as const,
-        }))
+        Array.isArray(data?.project?.testCases)
+          ? data.project.testCases.filter(Boolean).map((tc: TestCase) => ({
+              id: tc.id,
+              title: tc.title,
+              type: tc.type,
+              status: 'pending' as const,
+            }))
+          : []
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load project');

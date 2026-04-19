@@ -83,6 +83,15 @@ export default function ResultsPage({
       const res = await fetch(`/api/runs/${runId}`);
       if (!res.ok) throw new Error('Failed to fetch results');
       const result = await res.json();
+      // Ensure results array is safe with proper nested objects
+      if (result) {
+        result.results = Array.isArray(result.results)
+          ? result.results.filter(Boolean).map((r: TestResult) => ({
+              ...r,
+              testCase: r.testCase || { id: '', title: 'Unknown Test', code: '', type: 'unknown' },
+            }))
+          : [];
+      }
       setData(result);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load results');
@@ -187,7 +196,7 @@ export default function ResultsPage({
     );
   }
 
-  if (!data) {
+  if (!data || !data.run) {
     return (
       <ResultsLayout projectId={projectId}>
         <div className="text-center py-20">
@@ -320,8 +329,10 @@ export default function ResultsPage({
             <CardTitle className="text-base">Test Breakdown</CardTitle>
           </CardHeader>
           <CardContent className="space-y-2">
-            {data.results.map((result) => (
-              <div key={result.id} className="border rounded-lg">
+            {data.results.map((result) => {
+              if (!result) return null;
+              return (
+              <div key={result.id || Math.random()} className="border rounded-lg">
                 <button
                   onClick={() =>
                     setExpandedTest(expandedTest === result.id ? null : result.id)
@@ -387,7 +398,8 @@ export default function ResultsPage({
                   </div>
                 )}
               </div>
-            ))}
+            );
+            })}
           </CardContent>
         </Card>
       </div>

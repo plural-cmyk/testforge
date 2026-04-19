@@ -59,12 +59,15 @@ export default function HealPage({ params }: { params: Promise<{ id: string }> }
       const data = await res.json();
 
       const failedTests: HealItem[] = [];
-      for (const run of data.project.testRuns) {
+      const runs = Array.isArray(data?.project?.testRuns) ? data.project.testRuns : [];
+      for (const run of runs) {
+        if (!run?.id) continue;
         const runRes = await fetch(`/api/runs/${run.id}`);
         if (runRes.ok) {
           const runData = await runRes.json();
-          for (const result of runData.results) {
-            if (result.status === 'fail') {
+          const results = Array.isArray(runData?.results) ? runData.results : [];
+          for (const result of results) {
+            if (result?.status === 'fail' && result?.testCase && result?.testRun) {
               failedTests.push(result);
             }
           }
@@ -186,7 +189,9 @@ export default function HealPage({ params }: { params: Promise<{ id: string }> }
           </Card>
         ) : (
           <div className="space-y-6">
-            {healItems.map((item) => (
+            {healItems.map((item) => {
+              if (!item || !item.testCase || !item.testRun) return null;
+              return (
               <Card key={item.id}>
                 <CardHeader className="pb-3">
                   <div className="flex items-center justify-between">
@@ -258,7 +263,8 @@ export default function HealPage({ params }: { params: Promise<{ id: string }> }
                   )}
                 </CardContent>
               </Card>
-            ))}
+            );
+            })}
           </div>
         )}
       </div>

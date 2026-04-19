@@ -71,7 +71,7 @@ export function ResultsBadge({
   showLabel = true,
   className = '',
 }: ResultsBadgeProps) {
-  const config = statusConfig[status];
+  const config = statusConfig[status] || statusConfig.pending;
   const Icon = config.icon;
 
   return (

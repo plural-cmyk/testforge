@@ -54,7 +54,7 @@ export default function DashboardPage() {
       const res = await fetch('/api/projects');
       if (!res.ok) throw new Error('Failed to fetch projects');
       const data = await res.json();
-      setProjects(data.projects);
+      setProjects(Array.isArray(data.projects) ? data.projects.filter(Boolean) : []);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load projects');
     } finally {
@@ -73,12 +73,12 @@ export default function DashboardPage() {
   }
 
   function getLastRunStatus(project: Project): string | null {
-    if (project.testRuns.length === 0) return null;
-    return project.testRuns[0].status;
+    if (!project.testRuns || project.testRuns.length === 0) return null;
+    return project.testRuns[0]?.status ?? null;
   }
 
   function getLastRunSummary(project: Project): { passed: number; failed: number; flaky: number } | null {
-    if (project.testRuns.length === 0 || !project.testRuns[0].summary) return null;
+    if (!project.testRuns || project.testRuns.length === 0 || !project.testRuns[0]?.summary) return null;
     try {
       return JSON.parse(project.testRuns[0].summary);
     } catch {
@@ -133,6 +133,7 @@ export default function DashboardPage() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {projects.map((project) => {
+            if (!project) return null;
             const lastRunStatus = getLastRunStatus(project);
             const summary = getLastRunSummary(project);
 
@@ -174,11 +175,11 @@ export default function DashboardPage() {
                   <div className="flex items-center gap-4 text-xs text-muted-foreground">
                     <span className="flex items-center gap-1">
                       <TestTube2 className="h-3 w-3" />
-                      {project._count.testCases} tests
+                      {project._count?.testCases ?? 0} tests
                     </span>
                     <span className="flex items-center gap-1">
                       <Play className="h-3 w-3" />
-                      {project._count.testRuns} runs
+                      {project._count?.testRuns ?? 0} runs
                     </span>
                   </div>
 

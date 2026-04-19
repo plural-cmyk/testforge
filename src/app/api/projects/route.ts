@@ -12,11 +12,24 @@ export async function GET() {
         testRuns: {
           orderBy: { startedAt: 'desc' },
           take: 1,
+          select: {
+            id: true,
+            status: true,
+            startedAt: true,
+            summary: true,
+          },
         },
       },
     });
 
-    return NextResponse.json({ projects });
+    // Ensure every project has _count and testRuns
+    const safeProjects = projects.map((p) => ({
+      ...p,
+      _count: p._count || { testCases: 0, testRuns: 0 },
+      testRuns: Array.isArray(p.testRuns) ? p.testRuns : [],
+    }));
+
+    return NextResponse.json({ projects: safeProjects });
   } catch (error) {
     console.error('Error fetching projects:', error);
     return NextResponse.json(
