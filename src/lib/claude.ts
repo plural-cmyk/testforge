@@ -1,13 +1,7 @@
-import ZAI from 'z-ai-web-dev-sdk';
-
-let zaiInstance: Awaited<ReturnType<typeof ZAI.create>> | null = null;
-
-async function getZAI() {
-  if (!zaiInstance) {
-    zaiInstance = await ZAI.create();
-  }
-  return zaiInstance;
-}
+// TestForge AI Integration
+// Supports two backends:
+// 1. Production: OpenAI-compatible API (via OPENAI_API_KEY + OPENAI_BASE_URL)
+// 2. Sandbox: z-ai-web-dev-sdk (auto-configured in sandbox environment)
 
 export interface ClaudeMessage {
   role: 'system' | 'user' | 'assistant';
@@ -22,6 +16,88 @@ export interface ClaudeResponse {
   };
 }
 
+function isOpenAIConfigured(): boolean {
+  return !!(process.env.OPENAI_API_KEY);
+}
+
+function isSandboxAvailable(): boolean {
+  // z-ai-web-dev-sdk requires a .z-ai-config file that only exists in the sandbox
+  return typeof process !== 'undefined' && process.env.NODE_ENV === 'development';
+}
+
+async function callOpenAI(
+  messages: ClaudeMessage[],
+  options?: { maxTokens?: number; temperature?: number }
+): Promise<ClaudeResponse> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  const baseUrl = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
+  const model = process.env.OPENAI_MODEL || 'gpt-4o';
+
+  if (!apiKey) {
+    throw new Error('OPENAI_API_KEY environment variable is required for AI features. Please add it in your Vercel project settings.');
+  }
+
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
+      max_tokens: options?.maxTokens || 4096,
+      temperature: options?.temperature || 0.3,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`OpenAI API error (${response.status}): ${errorBody}`);
+  }
+
+  const data = await response.json();
+  const text = data.choices?.[0]?.message?.content || '';
+
+  return {
+    text,
+    usage: {
+      inputTokens: data.usage?.prompt_tokens || 0,
+      outputTokens: data.usage?.completion_tokens || 0,
+    },
+  };
+}
+
+async function callSandboxAI(
+  messages: ClaudeMessage[],
+  options?: { maxTokens?: number; temperature?: number }
+): Promise<ClaudeResponse> {
+  const ZAI = (await import('z-ai-web-dev-sdk')).default;
+  const zai = await ZAI.create();
+
+  const completion = await zai.chat.completions.create({
+    messages: messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    })),
+    max_tokens: options?.maxTokens || 4096,
+    temperature: options?.temperature || 0.3,
+  });
+
+  const text = completion.choices[0]?.message?.content || '';
+
+  return {
+    text,
+    usage: {
+      inputTokens: completion.usage?.prompt_tokens || 0,
+      outputTokens: completion.usage?.completion_tokens || 0,
+    },
+  };
+}
+
 export async function callClaude(
   messages: ClaudeMessage[],
   options?: {
@@ -30,29 +106,22 @@ export async function callClaude(
   }
 ): Promise<ClaudeResponse> {
   try {
-    const zai = await getZAI();
+    // Prefer OpenAI if configured (works in production/Vercel)
+    if (isOpenAIConfigured()) {
+      return await callOpenAI(messages, options);
+    }
 
-    const completion = await zai.chat.completions.create({
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
-      max_tokens: options?.maxTokens || 4096,
-      temperature: options?.temperature || 0.3,
-    });
+    // Fall back to sandbox SDK
+    if (isSandboxAvailable()) {
+      return await callSandboxAI(messages, options);
+    }
 
-    const text = completion.choices[0]?.message?.content || '';
-
-    return {
-      text,
-      usage: {
-        inputTokens: completion.usage?.prompt_tokens || 0,
-        outputTokens: completion.usage?.completion_tokens || 0,
-      },
-    };
+    throw new Error(
+      'No AI backend configured. Set OPENAI_API_KEY environment variable to enable AI features.'
+    );
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('Claude API error:', errorMessage);
+    console.error('AI API error:', errorMessage);
     throw new Error(`AI API call failed: ${errorMessage}`);
   }
 }
