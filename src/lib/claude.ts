@@ -1,7 +1,8 @@
 // TestForge AI Integration
-// Supports two backends:
-// 1. Production: OpenAI-compatible API (via OPENAI_API_KEY + OPENAI_BASE_URL)
-// 2. Sandbox: z-ai-web-dev-sdk (auto-configured in sandbox environment)
+// Supports three backends:
+// 1. Google Gemini API (via GEMINI_API_KEY — recommended, free tier available)
+// 2. OpenAI-compatible API (via OPENAI_API_KEY + OPENAI_BASE_URL)
+// 3. Sandbox: z-ai-web-dev-sdk (auto-configured in sandbox environment)
 
 export interface ClaudeMessage {
   role: 'system' | 'user' | 'assistant';
@@ -16,6 +17,10 @@ export interface ClaudeResponse {
   };
 }
 
+function isGeminiConfigured(): boolean {
+  return !!(process.env.GEMINI_API_KEY);
+}
+
 function isOpenAIConfigured(): boolean {
   return !!(process.env.OPENAI_API_KEY);
 }
@@ -23,6 +28,54 @@ function isOpenAIConfigured(): boolean {
 function isSandboxAvailable(): boolean {
   // z-ai-web-dev-sdk requires a .z-ai-config file that only exists in the sandbox
   return typeof process !== 'undefined' && process.env.NODE_ENV === 'development';
+}
+
+async function callGemini(
+  messages: ClaudeMessage[],
+  options?: { maxTokens?: number; temperature?: number }
+): Promise<ClaudeResponse> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY environment variable is required. Get one at https://aistudio.google.com/apikey');
+  }
+
+  // Gemini's OpenAI-compatible endpoint
+  const baseUrl = 'https://generativelanguage.googleapis.com/v1beta/openai';
+
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
+      max_tokens: options?.maxTokens || 4096,
+      temperature: options?.temperature || 0.3,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Gemini API error (${response.status}): ${errorBody}`);
+  }
+
+  const data = await response.json();
+  const text = data.choices?.[0]?.message?.content || '';
+
+  return {
+    text,
+    usage: {
+      inputTokens: data.usage?.prompt_tokens || 0,
+      outputTokens: data.usage?.completion_tokens || 0,
+    },
+  };
 }
 
 async function callOpenAI(
@@ -106,18 +159,23 @@ export async function callClaude(
   }
 ): Promise<ClaudeResponse> {
   try {
-    // Prefer OpenAI if configured (works in production/Vercel)
+    // Priority 1: Gemini (if GEMINI_API_KEY is set)
+    if (isGeminiConfigured()) {
+      return await callGemini(messages, options);
+    }
+
+    // Priority 2: OpenAI-compatible (if OPENAI_API_KEY is set)
     if (isOpenAIConfigured()) {
       return await callOpenAI(messages, options);
     }
 
-    // Fall back to sandbox SDK
+    // Priority 3: Sandbox SDK (development only)
     if (isSandboxAvailable()) {
       return await callSandboxAI(messages, options);
     }
 
     throw new Error(
-      'No AI backend configured. Set OPENAI_API_KEY environment variable to enable AI features.'
+      'No AI backend configured. Set GEMINI_API_KEY or OPENAI_API_KEY environment variable to enable AI features.'
     );
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
