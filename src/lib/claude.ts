@@ -1,15 +1,17 @@
 // TestForge AI Integration
 // Supports three backends with automatic retry + fallback:
-// 1. Google Gemini API (via GEMINI_API_KEY — recommended, free tier available)
+// 1. Google Gemini Native API (via GEMINI_API_KEY — uses native endpoint, different rate limit pool)
 // 2. OpenAI-compatible API (via OPENAI_API_KEY + OPENAI_BASE_URL)
 // 3. Sandbox: z-ai-web-dev-sdk (auto-configured in sandbox environment)
 //
-// On 429 (rate limit) or 503 (overloaded) errors, the system:
-// - Retries with aggressive exponential backoff (up to 5 attempts)
-// - 429 gets much longer backoff (10s, 30s, 60s) to wait for rate limit reset
-// - Tracks rate-limit cooldowns per backend to skip recently-limited backends
-// - Falls back to the next available backend if retries are exhausted
-// - Supports multiple Gemini API keys via GEMINI_API_KEY_2, GEMINI_API_KEY_3, etc.
+// Key anti-429 strategies:
+// - Uses Gemini NATIVE API (generateContent) instead of OpenAI-compatible endpoint
+//   (These have SEPARATE rate limit pools — switching often resolves persistent 429s)
+// - Aggressive exponential backoff for 429: 15s, 30s, 60s, 90s, 120s
+// - Rate-limit cooldown tracker (60s cooldown after 429)
+// - Key rotation (GEMINI_API_KEY, GEMINI_API_KEY_2, etc.)
+// - Automatic backend fallback
+// - Inter-call spacing to prevent burst rate limiting
 
 export interface ClaudeMessage {
   role: 'system' | 'user' | 'assistant';
@@ -32,9 +34,6 @@ const RATE_LIMIT_COOLDOWN_MS = 60_000; // 60s — Gemini rate limit window
 const INTER_CALL_DELAY_MS = 5_000; // 5s delay between sequential AI calls
 
 // ─── Rate Limit Cooldown Tracker ─────────────────────────────────
-// When a backend returns 429, we mark it as "cooling down" so
-// subsequent requests immediately try the fallback instead of
-// waiting through pointless retries.
 
 const backendCooldowns = new Map<string, number>();
 
@@ -57,11 +56,9 @@ function setBackendCooldown(name: string, durationMs: number = RATE_LIMIT_COOLDO
 
 function getGeminiApiKeys(): string[] {
   const keys: string[] = [];
-  // Primary key
   if (process.env.GEMINI_API_KEY) {
     keys.push(process.env.GEMINI_API_KEY);
   }
-  // Additional keys: GEMINI_API_KEY_2, GEMINI_API_KEY_3, etc.
   for (let i = 2; i <= 10; i++) {
     const key = process.env[`GEMINI_API_KEY_${i}`];
     if (key) keys.push(key);
@@ -97,16 +94,13 @@ function isRetryableStatus(status: number): boolean {
 }
 
 // ─── Backoff Calculation ─────────────────────────────────────────
-// For 429 (rate limit): very long backoff — 10s, 30s, 60s, 90s, 120s
-// For 503/500 (server error): standard backoff — 2s, 4s, 8s, 16s, 32s
 
 function calculateDelay(attempt: number, statusCode: number): number {
   const jitter = Math.random() * 2000;
 
   if (statusCode === 429) {
-    // Rate limit: aggressive backoff to wait for the quota reset window
-    // Gemini free tier resets every 60 seconds
-    const delays = [10_000, 30_000, 60_000, 90_000, 120_000];
+    // Rate limit: very aggressive backoff
+    const delays = [15_000, 30_000, 60_000, 90_000, 120_000];
     return (delays[attempt] || 120_000) + jitter;
   }
 
@@ -119,9 +113,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ─── Delay Between Sequential AI Calls ───────────────────────────
-// Call this before making a second, third, etc. AI call in sequence
-// to avoid hammering the rate limit.
+// ─── Inter-Call Spacing ──────────────────────────────────────────
 
 let lastCallTimestamp = 0;
 
@@ -138,7 +130,15 @@ function recordCallTime(): void {
   lastCallTimestamp = Date.now();
 }
 
-// ─── Gemini Backend (with key rotation) ──────────────────────────
+// ─── Gemini NATIVE API Backend ───────────────────────────────────
+// Uses the native generateContent endpoint instead of the
+// OpenAI-compatible one. These have SEPARATE rate limit pools,
+// so switching often resolves persistent 429 errors.
+
+interface GeminiContent {
+  role: string;
+  parts: Array<{ text: string }>;
+}
 
 async function callGemini(
   messages: ClaudeMessage[],
@@ -153,23 +153,48 @@ async function callGemini(
     throw new Error('GEMINI_API_KEY environment variable is required. Get one at https://aistudio.google.com/apikey');
   }
 
-  const baseUrl = 'https://generativelanguage.googleapis.com/v1beta/openai';
+  // Convert messages to Gemini native format
+  // Gemini uses "user" and "model" roles, with system prompt injected as first user message
+  const contents: GeminiContent[] = [];
+  let systemInstruction: string | undefined;
 
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  for (const msg of messages) {
+    if (msg.role === 'system') {
+      systemInstruction = msg.content;
+    } else if (msg.role === 'assistant') {
+      contents.push({ role: 'model', parts: [{ text: msg.content }] });
+    } else {
+      contents.push({ role: 'user', parts: [{ text: msg.content }] });
+    }
+  }
+
+  // Build request body for native Gemini API
+  const requestBody: Record<string, unknown> = {
+    contents,
+    generationConfig: {
+      maxOutputTokens: options?.maxTokens || 4096,
+      temperature: options?.temperature || 0.3,
+    },
+  };
+
+  if (systemInstruction) {
+    requestBody.systemInstruction = {
+      parts: [{ text: systemInstruction }],
+    };
+  }
+
+  // Use the NATIVE Gemini REST API endpoint (NOT the OpenAI-compatible one)
+  // This uses a DIFFERENT rate limit pool
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  console.log(`[AI] Gemini native API: model=${model}, key=${apiKeyIndex + 1}/${keys.length}`);
+
+  const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
     },
-    body: JSON.stringify({
-      model,
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
-      max_tokens: options?.maxTokens || 4096,
-      temperature: options?.temperature || 0.3,
-    }),
+    body: JSON.stringify(requestBody),
   });
 
   if (!response.ok) {
@@ -184,15 +209,23 @@ async function callGemini(
   }
 
   const data = await response.json();
-  const text = data.choices?.[0]?.message?.content || '';
+
+  // Parse native Gemini response format
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+  // Check for blocked content
+  if (data.candidates?.[0]?.finishReason === 'SAFETY') {
+    throw new Error('Gemini blocked the response due to safety filters. Try rephrasing your request.');
+  }
+
   const keyLabel = keys.length > 1 ? ` (key ${apiKeyIndex + 1}/${keys.length})` : '';
 
   return {
     text,
-    backend: `gemini/${model}${keyLabel}`,
+    backend: `gemini-native/${model}${keyLabel}`,
     usage: {
-      inputTokens: data.usage?.prompt_tokens || 0,
-      outputTokens: data.usage?.completion_tokens || 0,
+      inputTokens: data.usageMetadata?.promptTokenCount || 0,
+      outputTokens: data.usageMetadata?.candidatesTokenCount || 0,
     },
   };
 }
@@ -307,7 +340,6 @@ export async function callClaude(
 ): Promise<ClaudeResponse> {
   recordCallTime();
 
-  // Collect available backends, skipping those in cooldown
   const availableBackends = BACKENDS.filter((b) => {
     if (!b.isAvailable()) return false;
     if (isBackendCoolingDown(b.name)) {
@@ -318,7 +350,6 @@ export async function callClaude(
   });
 
   if (availableBackends.length === 0) {
-    // Check if backends exist but are all cooling down
     const allConfigured = BACKENDS.filter((b) => b.isAvailable());
     if (allConfigured.length > 0) {
       const cooldownRemaining = Math.min(
@@ -329,11 +360,7 @@ export async function callClaude(
       );
       throw new Error(
         `All AI backends are in rate-limit cooldown. ` +
-        `Please wait ${Math.ceil(cooldownRemaining / 1000)} seconds and try again.\n\n` +
-        `Tips to avoid this:\n` +
-        `• Add OPENAI_API_KEY as a fallback backend\n` +
-        `• Add GEMINI_API_KEY_2 for key rotation (multiple free keys)\n` +
-        `• Avoid rapid sequential AI operations`
+        `Please wait ${Math.ceil(cooldownRemaining / 1000)} seconds and try again.`
       );
     }
     throw new Error(
@@ -343,7 +370,6 @@ export async function callClaude(
 
   const errors: string[] = [];
 
-  // Try each available backend with retries
   for (const backend of availableBackends) {
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
@@ -357,16 +383,13 @@ export async function callClaude(
           outputTokens: response.usage?.outputTokens,
         });
 
-        // Clear cooldown on success
         backendCooldowns.delete(backend.name);
-
         return response;
       } catch (error: unknown) {
         if (error instanceof RetryableError) {
           const delay = calculateDelay(attempt, error.statusCode);
 
           if (error.statusCode === 429) {
-            // Set cooldown for this backend so other requests skip it
             setBackendCooldown(backend.name, RATE_LIMIT_COOLDOWN_MS);
           }
 
@@ -380,35 +403,28 @@ export async function callClaude(
             continue;
           }
 
-          errors.push(`${backend.name}: Rate limited (429) — retries exhausted after ${MAX_RETRIES} attempts`);
-          console.warn(
-            `[AI] ${backend.name} exhausted ${MAX_RETRIES} retries, falling back...`
-          );
+          errors.push(`${backend.name}: Rate limited (429) — retries exhausted`);
+          console.warn(`[AI] ${backend.name} exhausted retries, falling back...`);
           break;
         }
 
-        // Non-retryable error — try next backend
         const errorMsg = error instanceof Error ? error.message : 'Unknown error';
         errors.push(`${backend.name}: ${errorMsg}`);
-        console.warn(
-          `[AI] ${backend.name} failed with non-retryable error, falling back...`
-        );
+        console.warn(`[AI] ${backend.name} failed, falling back...`);
         break;
       }
     }
   }
 
-  // All backends failed
   const combinedErrors = errors.join('\n');
   console.error('[AI] All backends failed:', combinedErrors);
   throw new Error(
     `AI request failed — all backends exhausted.\n\n` +
     `Errors:\n${combinedErrors}\n\n` +
     `Solutions:\n` +
-    `1. Wait 60 seconds and try again (Gemini rate limit resets every minute)\n` +
+    `1. Wait 60 seconds and try again\n` +
     `2. Add OPENAI_API_KEY in Vercel env vars as a fallback\n` +
-    `3. Add GEMINI_API_KEY_2 for key rotation (create multiple free keys at https://aistudio.google.com/apikey)\n` +
-    `4. Use "frontend" or "backend" scope instead of "Full Stack" to reduce API calls`
+    `3. Use "frontend" or "backend" scope instead of "Full Stack" to use only 1 API call`
   );
 }
 
@@ -424,15 +440,31 @@ export async function generateTestCode(
     additionalInstructions?: string;
   }
 ): Promise<string> {
+  // For "fullstack" scope, generate ALL test types in a SINGLE API call
+  // This uses only 1 API request instead of 3, massively reducing rate limit risk
+  const scopeLabel = context.testType === 'fullstack'
+    ? 'frontend, backend, and E2E'
+    : context.testType;
+
   const systemPrompt = `You are an expert test automation engineer. You generate comprehensive, runnable test code.
 You MUST output ONLY valid test code — no markdown, no explanations, no comments outside the code.
 Match the testing framework to the project's tech stack.
 Write deterministic tests that are atomic and have no side effects.
 For API tests: test happy path, missing required fields, unauthorized access, and malformed input.
 For UI tests: test render success, user interaction, and error state display.
-For E2E tests: test complete user journeys from UI action to data persistence.`;
+For E2E tests: test complete user journeys from UI action to data persistence.
 
-  const userPrompt = `Generate ${context.testType} tests for the following project:
+${context.testType === 'fullstack' ? `When generating fullstack tests, output ALL test suites in a single file with clear section comments:
+// === FRONTEND TESTS ===
+... frontend test code ...
+
+// === BACKEND TESTS ===
+... backend test code ...
+
+// === E2E TESTS ===
+... e2e test code ...` : ''}`;
+
+  const userPrompt = `Generate ${scopeLabel} tests for the following project:
 
 Framework/Stack: ${context.framework}
 ${context.repoStructure ? `Repository Structure:\n${context.repoStructure}\n` : ''}
@@ -454,7 +486,7 @@ Output ONLY the test code, no markdown fences or explanations.`;
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ],
-    { maxTokens: 8192, temperature: 0.2 }
+    { maxTokens: 16384, temperature: 0.2 }
   );
 
   return response.text;

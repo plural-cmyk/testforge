@@ -1,4 +1,4 @@
-import { generateTestCode, rateLimitDelay } from './claude';
+import { generateTestCode } from './claude';
 import { DetectedStack, getRecommendedTestingFramework, formatStackSummary } from './stackDetector';
 import { db } from './db';
 
@@ -44,34 +44,23 @@ export async function generateTests(
   const testFramework = getRecommendedTestingFramework(detectedStack);
   const frameworkDescription = formatStackSummary(detectedStack);
 
-  const testTypes: Array<'frontend' | 'backend' | 'e2e'> =
-    testType === 'fullstack'
-      ? ['frontend', 'backend', 'e2e']
-      : [testType];
+  // SINGLE API CALL for all test types (including fullstack)
+  // Previously fullstack made 3 separate calls (frontend, backend, e2e)
+  // which exhausted Gemini's 15 RPM free tier in one click.
+  // Now we make just 1 call and parse the combined output.
+  const rawCode = await generateTestCode({
+    repoStructure: repoStructure || undefined,
+    apiSpec: apiSpec || project.apiSpecUrl || undefined,
+    appUrl: appUrl || project.appUrl || undefined,
+    framework: frameworkDescription,
+    testType,
+    additionalInstructions: additionalInstructions || undefined,
+  });
 
-  const allTests: GeneratedTestCase[] = [];
+  // Parse the generated code into individual test cases
+  const allTests = parseFullstackCode(rawCode, testType);
 
-  for (let typeIndex = 0; typeIndex < testTypes.length; typeIndex++) {
-    // Add delay between sequential AI calls to avoid rate limits
-    // (skip delay before the first call)
-    if (typeIndex > 0) {
-      await rateLimitDelay();
-    }
-
-    const currentType = testTypes[typeIndex];
-    const rawCode = await generateTestCode({
-      repoStructure: repoStructure || undefined,
-      apiSpec: apiSpec || project.apiSpecUrl || undefined,
-      appUrl: appUrl || project.appUrl || undefined,
-      framework: frameworkDescription,
-      testType: currentType,
-      additionalInstructions: additionalInstructions || undefined,
-    });
-
-    const testCases = parseGeneratedCode(rawCode, currentType);
-    allTests.push(...testCases);
-  }
-
+  // Save all test cases to database
   for (const testCase of allTests) {
     await db.testCase.create({
       data: {
@@ -85,6 +74,114 @@ export async function generateTests(
   }
 
   return allTests;
+}
+
+/**
+ * Parse generated code into test cases.
+ * For fullstack: splits on section markers (=== FRONTEND ===, etc.)
+ * For single scope: parses describe/test blocks as before
+ */
+function parseFullstackCode(
+  rawCode: string,
+  testType: 'frontend' | 'backend' | 'e2e' | 'fullstack'
+): GeneratedTestCase[] {
+  const cleanCode = rawCode
+    .replace(/^```(?:typescript|javascript|python|ts|js)?\n?/gm, '')
+    .replace(/\n?```$/gm, '')
+    .trim();
+
+  if (testType === 'fullstack') {
+    return parseFullstackSections(cleanCode);
+  }
+
+  // Single scope — parse as before
+  const testCases = parseGeneratedCode(cleanCode, testType);
+  return testCases;
+}
+
+/**
+ * Split fullstack output into frontend/backend/e2e sections
+ * based on the section markers we instruct the AI to include
+ */
+function parseFullstackSections(code: string): GeneratedTestCase[] {
+  const results: GeneratedTestCase[] = [];
+
+  // Try to split on section markers like:
+  // // === FRONTEND TESTS ===
+  // // === BACKEND TESTS ===
+  // // === E2E TESTS ===
+  const sectionPattern = /\/\/\s*===\s*(FRONTEND|BACKEND|E2E)\s+TESTS?\s*===/gi;
+  const matches = [...code.matchAll(sectionPattern)];
+
+  const typeMap: Record<string, 'frontend' | 'backend' | 'e2e'> = {
+    'FRONTEND': 'frontend',
+    'BACKEND': 'backend',
+    'E2E': 'e2e',
+  };
+
+  if (matches.length >= 2) {
+    // Found section markers — split the code
+    for (let i = 0; i < matches.length; i++) {
+      const start = matches[i].index!;
+      const end = i + 1 < matches.length ? matches[i + 1].index! : code.length;
+      const sectionCode = code.slice(start, end).trim();
+      const sectionType = typeMap[matches[i][1].toUpperCase()] || 'frontend';
+
+      const parsed = parseGeneratedCode(sectionCode, sectionType);
+      results.push(...parsed);
+    }
+  } else {
+    // No section markers found — split by describe blocks and infer types
+    // or just create 3 test cases from the whole output
+    const frontendTests = parseGeneratedCode(code, 'frontend');
+    const backendTests = parseGeneratedCode(code, 'backend');
+    const e2eTests = parseGeneratedCode(code, 'e2e');
+
+    // Take the best parsing result
+    if (frontendTests.length > 0) {
+      // Assign types based on test titles/content
+      const allParsed = [...frontendTests];
+      for (const tc of allParsed) {
+        const titleLower = tc.title.toLowerCase();
+        const codeLower = tc.code.toLowerCase();
+        if (titleLower.includes('e2e') || codeLower.includes('playwright') || codeLower.includes('page.goto')) {
+          tc.type = 'e2e';
+        } else if (titleLower.includes('api') || titleLower.includes('endpoint') || codeLower.includes('supertest') || codeLower.includes('request(')) {
+          tc.type = 'backend';
+        } else {
+          tc.type = 'frontend';
+        }
+      }
+      results.push(...allParsed);
+    } else {
+      // Fallback: split code into 3 roughly equal chunks
+      const lines = code.split('\n');
+      const chunkSize = Math.ceil(lines.length / 3);
+      const types: Array<'frontend' | 'backend' | 'e2e'> = ['frontend', 'backend', 'e2e'];
+
+      for (let i = 0; i < 3; i++) {
+        const chunk = lines.slice(i * chunkSize, (i + 1) * chunkSize).join('\n').trim();
+        if (chunk.length > 20) { // Skip empty/tiny chunks
+          results.push({
+            title: `${types[i].charAt(0).toUpperCase() + types[i].slice(1)} Test Suite`,
+            code: chunk,
+            type: types[i],
+          });
+        }
+      }
+    }
+  }
+
+  // If we still have no results, create a single test case
+  if (results.length === 0) {
+    results.push({
+      title: 'Full Stack Test Suite',
+      code: code,
+      type: 'frontend',
+    });
+  }
+
+  return results;
 }
 
 function parseGeneratedCode(
