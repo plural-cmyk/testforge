@@ -5,8 +5,11 @@
 // 3. Sandbox: z-ai-web-dev-sdk (auto-configured in sandbox environment)
 //
 // On 429 (rate limit) or 503 (overloaded) errors, the system:
-// - Retries with exponential backoff (up to 3 attempts)
+// - Retries with aggressive exponential backoff (up to 5 attempts)
+// - 429 gets much longer backoff (10s, 30s, 60s) to wait for rate limit reset
+// - Tracks rate-limit cooldowns per backend to skip recently-limited backends
 // - Falls back to the next available backend if retries are exhausted
+// - Supports multiple Gemini API keys via GEMINI_API_KEY_2, GEMINI_API_KEY_3, etc.
 
 export interface ClaudeMessage {
   role: 'system' | 'user' | 'assistant';
@@ -19,17 +22,55 @@ export interface ClaudeResponse {
     inputTokens: number;
     outputTokens: number;
   };
-  backend?: string; // Which backend was used
+  backend?: string;
 }
 
 // ─── Configuration ───────────────────────────────────────────────
 
-const MAX_RETRIES = 3;
-const BASE_DELAY_MS = 1000; // 1s initial backoff
-const MAX_DELAY_MS = 15000; // 15s max backoff
+const MAX_RETRIES = 5;
+const RATE_LIMIT_COOLDOWN_MS = 60_000; // 60s — Gemini rate limit window
+const INTER_CALL_DELAY_MS = 5_000; // 5s delay between sequential AI calls
+
+// ─── Rate Limit Cooldown Tracker ─────────────────────────────────
+// When a backend returns 429, we mark it as "cooling down" so
+// subsequent requests immediately try the fallback instead of
+// waiting through pointless retries.
+
+const backendCooldowns = new Map<string, number>();
+
+function isBackendCoolingDown(name: string): boolean {
+  const cooldownUntil = backendCooldowns.get(name);
+  if (!cooldownUntil) return false;
+  if (Date.now() >= cooldownUntil) {
+    backendCooldowns.delete(name);
+    return false;
+  }
+  return true;
+}
+
+function setBackendCooldown(name: string, durationMs: number = RATE_LIMIT_COOLDOWN_MS): void {
+  backendCooldowns.set(name, Date.now() + durationMs);
+  console.warn(`[AI] ${name} is now in cooldown for ${Math.round(durationMs / 1000)}s`);
+}
+
+// ─── Backend Availability Checks ─────────────────────────────────
+
+function getGeminiApiKeys(): string[] {
+  const keys: string[] = [];
+  // Primary key
+  if (process.env.GEMINI_API_KEY) {
+    keys.push(process.env.GEMINI_API_KEY);
+  }
+  // Additional keys: GEMINI_API_KEY_2, GEMINI_API_KEY_3, etc.
+  for (let i = 2; i <= 10; i++) {
+    const key = process.env[`GEMINI_API_KEY_${i}`];
+    if (key) keys.push(key);
+  }
+  return keys;
+}
 
 function isGeminiConfigured(): boolean {
-  return !!(process.env.GEMINI_API_KEY);
+  return getGeminiApiKeys().length > 0;
 }
 
 function isOpenAIConfigured(): boolean {
@@ -40,7 +81,7 @@ function isSandboxAvailable(): boolean {
   return typeof process !== 'undefined' && process.env.NODE_ENV === 'development';
 }
 
-// ─── Retry Helper ────────────────────────────────────────────────
+// ─── Error Types ─────────────────────────────────────────────────
 
 class RetryableError extends Error {
   public readonly statusCode: number;
@@ -52,35 +93,66 @@ class RetryableError extends Error {
 }
 
 function isRetryableStatus(status: number): boolean {
-  // 429 = rate limited, 503 = service overloaded, 500 = server error
   return status === 429 || status === 503 || status === 500;
 }
 
-function calculateDelay(attempt: number): number {
-  // Exponential backoff with jitter: 1s, 2s, 4s (±random)
-  const exponentialDelay = BASE_DELAY_MS * Math.pow(2, attempt);
-  const jitter = Math.random() * 1000;
-  return Math.min(exponentialDelay + jitter, MAX_DELAY_MS);
+// ─── Backoff Calculation ─────────────────────────────────────────
+// For 429 (rate limit): very long backoff — 10s, 30s, 60s, 90s, 120s
+// For 503/500 (server error): standard backoff — 2s, 4s, 8s, 16s, 32s
+
+function calculateDelay(attempt: number, statusCode: number): number {
+  const jitter = Math.random() * 2000;
+
+  if (statusCode === 429) {
+    // Rate limit: aggressive backoff to wait for the quota reset window
+    // Gemini free tier resets every 60 seconds
+    const delays = [10_000, 30_000, 60_000, 90_000, 120_000];
+    return (delays[attempt] || 120_000) + jitter;
+  }
+
+  // Server error: standard exponential backoff
+  const exponentialDelay = 2000 * Math.pow(2, attempt);
+  return Math.min(exponentialDelay + jitter, 32_000);
 }
 
-async function sleep(ms: number): Promise<void> {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ─── Gemini Backend ──────────────────────────────────────────────
+// ─── Delay Between Sequential AI Calls ───────────────────────────
+// Call this before making a second, third, etc. AI call in sequence
+// to avoid hammering the rate limit.
+
+let lastCallTimestamp = 0;
+
+export async function rateLimitDelay(): Promise<void> {
+  const elapsed = Date.now() - lastCallTimestamp;
+  const remaining = INTER_CALL_DELAY_MS - elapsed;
+  if (remaining > 0) {
+    console.log(`[AI] Rate-limit spacing: waiting ${Math.round(remaining / 1000)}s before next call...`);
+    await sleep(remaining);
+  }
+}
+
+function recordCallTime(): void {
+  lastCallTimestamp = Date.now();
+}
+
+// ─── Gemini Backend (with key rotation) ──────────────────────────
 
 async function callGemini(
   messages: ClaudeMessage[],
-  options?: { maxTokens?: number; temperature?: number }
+  options?: { maxTokens?: number; temperature?: number },
+  apiKeyIndex: number = 0
 ): Promise<ClaudeResponse> {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const keys = getGeminiApiKeys();
+  const apiKey = keys[apiKeyIndex % keys.length];
   const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY environment variable is required. Get one at https://aistudio.google.com/apikey');
   }
 
-  // Gemini's OpenAI-compatible endpoint
   const baseUrl = 'https://generativelanguage.googleapis.com/v1beta/openai';
 
   const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -113,10 +185,11 @@ async function callGemini(
 
   const data = await response.json();
   const text = data.choices?.[0]?.message?.content || '';
+  const keyLabel = keys.length > 1 ? ` (key ${apiKeyIndex + 1}/${keys.length})` : '';
 
   return {
     text,
-    backend: `gemini/${model}`,
+    backend: `gemini/${model}${keyLabel}`,
     usage: {
       inputTokens: data.usage?.prompt_tokens || 0,
       outputTokens: data.usage?.completion_tokens || 0,
@@ -135,7 +208,7 @@ async function callOpenAI(
   const model = process.env.OPENAI_MODEL || 'gpt-4o';
 
   if (!apiKey) {
-    throw new Error('OPENAI_API_KEY environment variable is required for AI features. Please add it in your Vercel project settings.');
+    throw new Error('OPENAI_API_KEY environment variable is required. Please add it in your Vercel project settings.');
   }
 
   const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -232,16 +305,42 @@ export async function callClaude(
     temperature?: number;
   }
 ): Promise<ClaudeResponse> {
-  // Collect available backends in priority order
-  const availableBackends = BACKENDS.filter((b) => b.isAvailable());
+  recordCallTime();
+
+  // Collect available backends, skipping those in cooldown
+  const availableBackends = BACKENDS.filter((b) => {
+    if (!b.isAvailable()) return false;
+    if (isBackendCoolingDown(b.name)) {
+      console.log(`[AI] Skipping ${b.name} — in rate-limit cooldown`);
+      return false;
+    }
+    return true;
+  });
 
   if (availableBackends.length === 0) {
+    // Check if backends exist but are all cooling down
+    const allConfigured = BACKENDS.filter((b) => b.isAvailable());
+    if (allConfigured.length > 0) {
+      const cooldownRemaining = Math.min(
+        ...allConfigured.map((b) => {
+          const until = backendCooldowns.get(b.name) || 0;
+          return Math.max(0, until - Date.now());
+        })
+      );
+      throw new Error(
+        `All AI backends are in rate-limit cooldown. ` +
+        `Please wait ${Math.ceil(cooldownRemaining / 1000)} seconds and try again.\n\n` +
+        `Tips to avoid this:\n` +
+        `• Add OPENAI_API_KEY as a fallback backend\n` +
+        `• Add GEMINI_API_KEY_2 for key rotation (multiple free keys)\n` +
+        `• Avoid rapid sequential AI operations`
+      );
+    }
     throw new Error(
       'No AI backend configured. Set GEMINI_API_KEY or OPENAI_API_KEY environment variable to enable AI features.'
     );
   }
 
-  // Track errors for the final error message
   const errors: string[] = [];
 
   // Try each available backend with retries
@@ -257,38 +356,44 @@ export async function callClaude(
           inputTokens: response.usage?.inputTokens,
           outputTokens: response.usage?.outputTokens,
         });
+
+        // Clear cooldown on success
+        backendCooldowns.delete(backend.name);
+
         return response;
       } catch (error: unknown) {
         if (error instanceof RetryableError) {
-          // Retryable error (429, 503, 500) — retry with backoff
-          const delay = calculateDelay(attempt);
+          const delay = calculateDelay(attempt, error.statusCode);
+
+          if (error.statusCode === 429) {
+            // Set cooldown for this backend so other requests skip it
+            setBackendCooldown(backend.name, RATE_LIMIT_COOLDOWN_MS);
+          }
+
           console.warn(
-            `[AI] ${backend.name} returned retryable error (${error.statusCode}), ` +
-            `retrying in ${Math.round(delay)}ms... (attempt ${attempt + 1}/${MAX_RETRIES})`
+            `[AI] ${backend.name} returned ${error.statusCode} (attempt ${attempt + 1}/${MAX_RETRIES}), ` +
+            `retrying in ${Math.round(delay / 1000)}s...`
           );
 
           if (attempt < MAX_RETRIES - 1) {
             await sleep(delay);
-            continue; // Retry same backend
+            continue;
           }
 
-          // Exhausted retries for this backend — log and try next
-          errors.push(`${backend.name}: ${error.message} (retries exhausted)`);
+          errors.push(`${backend.name}: Rate limited (429) — retries exhausted after ${MAX_RETRIES} attempts`);
           console.warn(
-            `[AI] ${backend.name} exhausted ${MAX_RETRIES} retries, ` +
-            `falling back to next available backend...`
+            `[AI] ${backend.name} exhausted ${MAX_RETRIES} retries, falling back...`
           );
-          break; // Move to next backend
+          break;
         }
 
         // Non-retryable error — try next backend
         const errorMsg = error instanceof Error ? error.message : 'Unknown error';
         errors.push(`${backend.name}: ${errorMsg}`);
         console.warn(
-          `[AI] ${backend.name} failed with non-retryable error, ` +
-          `falling back to next available backend...`
+          `[AI] ${backend.name} failed with non-retryable error, falling back...`
         );
-        break; // Move to next backend
+        break;
       }
     }
   }
@@ -297,11 +402,13 @@ export async function callClaude(
   const combinedErrors = errors.join('\n');
   console.error('[AI] All backends failed:', combinedErrors);
   throw new Error(
-    `All AI backends failed. Errors:\n${combinedErrors}\n\n` +
-    'Tips:\n' +
-    '- If using Gemini free tier, you may have hit the rate limit. Wait a minute and try again.\n' +
-    '- Add OPENAI_API_KEY as a fallback backend in your Vercel environment variables.\n' +
-    '- Gemini free tier: 15 RPM / 1M tokens per minute for flash models.'
+    `AI request failed — all backends exhausted.\n\n` +
+    `Errors:\n${combinedErrors}\n\n` +
+    `Solutions:\n` +
+    `1. Wait 60 seconds and try again (Gemini rate limit resets every minute)\n` +
+    `2. Add OPENAI_API_KEY in Vercel env vars as a fallback\n` +
+    `3. Add GEMINI_API_KEY_2 for key rotation (create multiple free keys at https://aistudio.google.com/apikey)\n` +
+    `4. Use "frontend" or "backend" scope instead of "Full Stack" to reduce API calls`
   );
 }
 

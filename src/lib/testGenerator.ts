@@ -1,4 +1,4 @@
-import { generateTestCode } from './claude';
+import { generateTestCode, rateLimitDelay } from './claude';
 import { DetectedStack, getRecommendedTestingFramework, formatStackSummary } from './stackDetector';
 import { db } from './db';
 
@@ -51,7 +51,14 @@ export async function generateTests(
 
   const allTests: GeneratedTestCase[] = [];
 
-  for (const currentType of testTypes) {
+  for (let typeIndex = 0; typeIndex < testTypes.length; typeIndex++) {
+    // Add delay between sequential AI calls to avoid rate limits
+    // (skip delay before the first call)
+    if (typeIndex > 0) {
+      await rateLimitDelay();
+    }
+
+    const currentType = testTypes[typeIndex];
     const rawCode = await generateTestCode({
       repoStructure: repoStructure || undefined,
       apiSpec: apiSpec || project.apiSpecUrl || undefined,
