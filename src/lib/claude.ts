@@ -1,8 +1,12 @@
 // TestForge AI Integration
-// Supports three backends:
+// Supports three backends with automatic retry + fallback:
 // 1. Google Gemini API (via GEMINI_API_KEY — recommended, free tier available)
 // 2. OpenAI-compatible API (via OPENAI_API_KEY + OPENAI_BASE_URL)
 // 3. Sandbox: z-ai-web-dev-sdk (auto-configured in sandbox environment)
+//
+// On 429 (rate limit) or 503 (overloaded) errors, the system:
+// - Retries with exponential backoff (up to 3 attempts)
+// - Falls back to the next available backend if retries are exhausted
 
 export interface ClaudeMessage {
   role: 'system' | 'user' | 'assistant';
@@ -15,7 +19,14 @@ export interface ClaudeResponse {
     inputTokens: number;
     outputTokens: number;
   };
+  backend?: string; // Which backend was used
 }
+
+// ─── Configuration ───────────────────────────────────────────────
+
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 1000; // 1s initial backoff
+const MAX_DELAY_MS = 15000; // 15s max backoff
 
 function isGeminiConfigured(): boolean {
   return !!(process.env.GEMINI_API_KEY);
@@ -26,9 +37,37 @@ function isOpenAIConfigured(): boolean {
 }
 
 function isSandboxAvailable(): boolean {
-  // z-ai-web-dev-sdk requires a .z-ai-config file that only exists in the sandbox
   return typeof process !== 'undefined' && process.env.NODE_ENV === 'development';
 }
+
+// ─── Retry Helper ────────────────────────────────────────────────
+
+class RetryableError extends Error {
+  public readonly statusCode: number;
+  constructor(message: string, statusCode: number) {
+    super(message);
+    this.name = 'RetryableError';
+    this.statusCode = statusCode;
+  }
+}
+
+function isRetryableStatus(status: number): boolean {
+  // 429 = rate limited, 503 = service overloaded, 500 = server error
+  return status === 429 || status === 503 || status === 500;
+}
+
+function calculateDelay(attempt: number): number {
+  // Exponential backoff with jitter: 1s, 2s, 4s (±random)
+  const exponentialDelay = BASE_DELAY_MS * Math.pow(2, attempt);
+  const jitter = Math.random() * 1000;
+  return Math.min(exponentialDelay + jitter, MAX_DELAY_MS);
+}
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ─── Gemini Backend ──────────────────────────────────────────────
 
 async function callGemini(
   messages: ClaudeMessage[],
@@ -63,6 +102,12 @@ async function callGemini(
 
   if (!response.ok) {
     const errorBody = await response.text();
+    if (isRetryableStatus(response.status)) {
+      throw new RetryableError(
+        `Gemini API error (${response.status}): ${errorBody}`,
+        response.status
+      );
+    }
     throw new Error(`Gemini API error (${response.status}): ${errorBody}`);
   }
 
@@ -71,12 +116,15 @@ async function callGemini(
 
   return {
     text,
+    backend: `gemini/${model}`,
     usage: {
       inputTokens: data.usage?.prompt_tokens || 0,
       outputTokens: data.usage?.completion_tokens || 0,
     },
   };
 }
+
+// ─── OpenAI Backend ──────────────────────────────────────────────
 
 async function callOpenAI(
   messages: ClaudeMessage[],
@@ -109,6 +157,12 @@ async function callOpenAI(
 
   if (!response.ok) {
     const errorBody = await response.text();
+    if (isRetryableStatus(response.status)) {
+      throw new RetryableError(
+        `OpenAI API error (${response.status}): ${errorBody}`,
+        response.status
+      );
+    }
     throw new Error(`OpenAI API error (${response.status}): ${errorBody}`);
   }
 
@@ -117,12 +171,15 @@ async function callOpenAI(
 
   return {
     text,
+    backend: `openai/${model}`,
     usage: {
       inputTokens: data.usage?.prompt_tokens || 0,
       outputTokens: data.usage?.completion_tokens || 0,
     },
   };
 }
+
+// ─── Sandbox Backend ─────────────────────────────────────────────
 
 async function callSandboxAI(
   messages: ClaudeMessage[],
@@ -144,12 +201,29 @@ async function callSandboxAI(
 
   return {
     text,
+    backend: 'sandbox',
     usage: {
       inputTokens: completion.usage?.prompt_tokens || 0,
       outputTokens: completion.usage?.completion_tokens || 0,
     },
   };
 }
+
+// ─── Backend Definitions ─────────────────────────────────────────
+
+interface Backend {
+  name: string;
+  isAvailable: () => boolean;
+  call: (messages: ClaudeMessage[], options?: { maxTokens?: number; temperature?: number }) => Promise<ClaudeResponse>;
+}
+
+const BACKENDS: Backend[] = [
+  { name: 'Gemini', isAvailable: isGeminiConfigured, call: callGemini },
+  { name: 'OpenAI', isAvailable: isOpenAIConfigured, call: callOpenAI },
+  { name: 'Sandbox', isAvailable: isSandboxAvailable, call: callSandboxAI },
+];
+
+// ─── Main Entry Point with Retry + Fallback ─────────────────────
 
 export async function callClaude(
   messages: ClaudeMessage[],
@@ -158,31 +232,80 @@ export async function callClaude(
     temperature?: number;
   }
 ): Promise<ClaudeResponse> {
-  try {
-    // Priority 1: Gemini (if GEMINI_API_KEY is set)
-    if (isGeminiConfigured()) {
-      return await callGemini(messages, options);
-    }
+  // Collect available backends in priority order
+  const availableBackends = BACKENDS.filter((b) => b.isAvailable());
 
-    // Priority 2: OpenAI-compatible (if OPENAI_API_KEY is set)
-    if (isOpenAIConfigured()) {
-      return await callOpenAI(messages, options);
-    }
-
-    // Priority 3: Sandbox SDK (development only)
-    if (isSandboxAvailable()) {
-      return await callSandboxAI(messages, options);
-    }
-
+  if (availableBackends.length === 0) {
     throw new Error(
       'No AI backend configured. Set GEMINI_API_KEY or OPENAI_API_KEY environment variable to enable AI features.'
     );
-  } catch (error: unknown) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('AI API error:', errorMessage);
-    throw new Error(`AI API call failed: ${errorMessage}`);
   }
+
+  // Track errors for the final error message
+  const errors: string[] = [];
+
+  // Try each available backend with retries
+  for (const backend of availableBackends) {
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        console.log(
+          `[AI] Calling ${backend.name} (attempt ${attempt + 1}/${MAX_RETRIES})`
+        );
+        const response = await backend.call(messages, options);
+        console.log(`[AI] ${backend.name} succeeded`, {
+          backend: response.backend,
+          inputTokens: response.usage?.inputTokens,
+          outputTokens: response.usage?.outputTokens,
+        });
+        return response;
+      } catch (error: unknown) {
+        if (error instanceof RetryableError) {
+          // Retryable error (429, 503, 500) — retry with backoff
+          const delay = calculateDelay(attempt);
+          console.warn(
+            `[AI] ${backend.name} returned retryable error (${error.statusCode}), ` +
+            `retrying in ${Math.round(delay)}ms... (attempt ${attempt + 1}/${MAX_RETRIES})`
+          );
+
+          if (attempt < MAX_RETRIES - 1) {
+            await sleep(delay);
+            continue; // Retry same backend
+          }
+
+          // Exhausted retries for this backend — log and try next
+          errors.push(`${backend.name}: ${error.message} (retries exhausted)`);
+          console.warn(
+            `[AI] ${backend.name} exhausted ${MAX_RETRIES} retries, ` +
+            `falling back to next available backend...`
+          );
+          break; // Move to next backend
+        }
+
+        // Non-retryable error — try next backend
+        const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+        errors.push(`${backend.name}: ${errorMsg}`);
+        console.warn(
+          `[AI] ${backend.name} failed with non-retryable error, ` +
+          `falling back to next available backend...`
+        );
+        break; // Move to next backend
+      }
+    }
+  }
+
+  // All backends failed
+  const combinedErrors = errors.join('\n');
+  console.error('[AI] All backends failed:', combinedErrors);
+  throw new Error(
+    `All AI backends failed. Errors:\n${combinedErrors}\n\n` +
+    'Tips:\n' +
+    '- If using Gemini free tier, you may have hit the rate limit. Wait a minute and try again.\n' +
+    '- Add OPENAI_API_KEY as a fallback backend in your Vercel environment variables.\n' +
+    '- Gemini free tier: 15 RPM / 1M tokens per minute for flash models.'
+  );
 }
+
+// ─── High-Level AI Functions ─────────────────────────────────────
 
 export async function generateTestCode(
   context: {
